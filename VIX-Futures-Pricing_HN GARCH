@@ -1,0 +1,87 @@
+import numpy as np
+from scipy.integrate import quad
+import matplotlib.pyplot as plt
+
+# Define the parameters based on values found in the Model Implied VIX
+omega_hat= 1e-08
+beta_hat = 0.9195669045490343
+alpha_hat= 1.2766014101177407e-05
+delta_star_hat= 54.567231440848396
+betatilde = 0.9575787678861795
+long_run_variance =  0.00029364429508088315
+gamma_hat=  0.6586156932730645
+lambda_hat = 0
+# Update `H_iterative` and `C_iterative` functions
+def H_iterative(phi, m, alpha, beta, delta_star):
+    H_value = phi
+    for _ in range(m):
+        denom = 1 - 2 * alpha * H_value
+        if denom == 0:
+            raise ZeroDivisionError("Encountered division by zero in H_iterative.")
+        H_value = ((alpha * delta_star * H_value) / denom) + beta * H_value
+    return H_value
+
+def C_iterative(phi, m, omega, alpha, beta, delta_star):
+    C_value = 0
+    H_value = phi
+    for _ in range(m):
+        denom = 1 - 2 * alpha * H_value
+        if denom == 0:
+            raise ZeroDivisionError("Encountered division by zero in C_iterative.")
+        H_value = ((alpha * delta_star * H_value) / denom) + beta * H_value
+        log_arg = 1 - 2 * alpha * H_value
+        if log_arg <= 0:
+            raise ValueError("Logarithm argument is non-positive.")
+        C_value = C_value - 0.5 * np.log(log_arg) + omega * H_value
+    return C_value
+
+def f_iterative(x, maturity, ht1, omega, alpha, beta, delta_star):
+    C_value = C_iterative(x, maturity, omega, alpha, beta, delta_star)
+    H_value = H_iterative(x, maturity, alpha, beta, delta_star)
+    return np.exp(C_value + H_value * ht1)
+
+# Function to calculate the integrand with added `vix` parameter
+def integrand(s, a, b, maturity, ht1, omega_hat, alpha_hat, beta_hat, delta_star, vix):
+    try:
+        value = (1 - np.exp(-s * a) * f_iterative(-s * b, maturity, ht1, omega_hat, alpha_hat, beta_hat, delta_star)) / (s ** (3 / 2))
+        return max(value, 0)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return 0
+
+# Main VIX Futures Price Calculation Function
+def vix_futures_price(params, vix, T, t, long_run_variance, gamma, maturity):
+    omega_hat, alpha_hat, beta_hat, delta_hat, lambda_ = params
+    delta_star = delta_hat + lambda_
+
+    a = 252 * (1 - gamma) * long_run_variance
+    b = 252 * gamma
+
+    vix_t = max(vix, 1e-3)  # Avoid zero values for VIX
+    ht1 = max(((vix_t / 100) ** 2 - a) / b, 1e-8)  # Ensure ht1 remains positive
+
+    integral_value, _ = quad(
+        integrand,
+        0,
+        1000,
+        args=(a, b, maturity, ht1, omega_hat, alpha_hat, beta_hat, delta_star, vix),
+        limit=100,
+        epsabs=1e-4,
+        epsrel=1e-4
+    )
+
+    futures_price = 100 / (2 * np.sqrt(np.pi)) * integral_value
+    futures_price = max(futures_price, vix_t * 0.8)  # Set a lower bound to avoid severe underestimation
+
+    return futures_price
+
+# Example usage with parameters
+vix = 18
+maturity = 22 # Set maturity dynamically
+T=maturity # Current VIX level
+
+lambda_hat = 0  # Assumed lambda for example; adjust if needed
+params = (omega_hat, alpha_hat, beta_hat, delta_star_hat, lambda_hat)
+t=0
+# Calculate the futures price using the modified function
+price = vix_futures_price(params, vix, t, T, long_run_variance, gamma_hat, maturity)
+print("VIX futures price:", price)
