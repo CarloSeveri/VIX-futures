@@ -1,0 +1,104 @@
+import numpy as np
+import pandas as pd
+from scipy.integrate import quad
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+#insert your file's directory. The file should have VIX FUtures data
+data = pd.read_excel('/Users/carloseveri/Downloads/Generic 1st UX Future index.xlsx', parse_dates=['Date'])
+
+# Define the parameters based on provided values
+omega = 1e-08
+beta = 0.9195669045490343
+alpha = 1.2766014101177407e-05
+delta_star_hat = 54.567231440848396
+betatilde = 0.9575787678861795
+long_run_variance = 0.00030117027404810037
+gamma = 0.6586156932730645
+lambda_hat = 0  # Assume no additional lambda for simplicity
+
+# Function definitions for H_iterative, C_iterative, f_iterative, and integrand remain the same
+def H_iterative(phi, m, alpha, beta, delta_star):
+    H_value = phi
+    for _ in range(m):
+        denom = 1 - 2 * alpha * H_value
+        if denom == 0:
+            raise ZeroDivisionError("Encountered division by zero in H_iterative.")
+        H_value = ((alpha * delta_star * H_value) / denom) + beta * H_value
+    return H_value
+
+def C_iterative(phi, m, omega, alpha, beta, delta_star):
+    C_value = 0
+    H_value = phi
+    for _ in range(m):
+        denom = 1 - 2 * alpha * H_value
+        if denom == 0:
+            raise ZeroDivisionError("Encountered division by zero in C_iterative.")
+        H_value = ((alpha * delta_star * H_value) / denom) + beta * H_value
+        log_arg = 1 - 2 * alpha * H_value
+        if log_arg <= 0:
+            raise ValueError("Logarithm argument is non-positive.")
+        C_value = C_value - 0.5 * np.log(log_arg) + omega * H_value
+    return C_value
+
+def f_iterative(x, maturity, ht1, omega, alpha, beta, delta_star):
+    C_value = C_iterative(x, maturity, omega, alpha, beta, delta_star)
+    H_value = H_iterative(x, maturity, alpha, beta, delta_star)
+    return np.exp(C_value + H_value * ht1)
+
+def integrand(s, a, b, maturity, ht1, omega_hat, alpha_hat, beta_hat, delta_star, vix):
+    try:
+        value = (1 - np.exp(-s * a) * f_iterative(-s * b, maturity, ht1, omega_hat, alpha_hat, beta_hat, delta_star)) / (s ** (3 / 2))
+        return max(value, 0)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return 0
+
+# VIX Futures Price Calculation Function
+def vix_futures_price(params, vix, T, t, long_run_variance, gamma, maturity):
+    omega_hat, alpha_hat, beta_hat, delta_hat, lambda_ = params
+    delta_star = delta_hat + lambda_
+
+    a = 252 * (1 - gamma) * long_run_variance
+    b = 252 * gamma
+
+    vix_t = max(vix, 1e-3)  # Avoid zero values for VIX
+    ht1 = max(((vix_t / 100) ** 2 - a) / b, 1e-8)  # Ensure ht1 remains positive
+
+    integral_value, _ = quad(
+        integrand,
+        0,
+        1000,
+        args=(a, b, maturity, ht1, omega_hat, alpha_hat, beta_hat, delta_star, vix),
+        limit=100,
+        epsabs=1e-4,
+        epsrel=1e-4
+    )
+
+    futures_price = 100 / (2 * np.sqrt(np.pi)) * integral_value
+    futures_price = max(futures_price, vix_t * 0.8)  # Set a lower bound to avoid severe underestimation
+
+    return futures_price
+
+# Fetch VIX data from Yahoo Finance from 2019 to today
+vix_data = yf.download('^VIX', start='2020-01-01', end='2023-06-01')
+vix_data = vix_data[['Close']].rename(columns={'Close': 'VIX'})
+
+# Set up parameters and calculate futures prices
+params = (omega, alpha, beta, delta_star_hat, lambda_hat)
+T = len(vix_data)  # Total number of time points
+t = np.arange(T)  # Time indices
+maturity = 5 # Example maturity in days
+
+# Calculate VIX futures prices for each date
+vix_data['VIX_Futures'] = vix_data['VIX'].apply(lambda vix: vix_futures_price(params, vix, T, t, long_run_variance, gamma, maturity))
+
+# Plotting the VIX and VIX futures prices
+plt.figure(figsize=(14, 8))
+plt.plot(vix_data.index, vix_data['VIX'], label='VIX', color='blue', linewidth = 0.8)
+plt.plot(vix_data.index, vix_data['VIX_Futures'], label='VIX Futures', color='red', linewidth = 0.9)
+plt.title('VIX and VIX Futures Price from 2019 to Today')
+plt.xlabel('Date')
+plt.ylabel('Value')
+plt.grid(True)
+plt.legend()
+plt.show()
