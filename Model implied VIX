@@ -1,0 +1,170 @@
+import numpy as np
+import yfinance as yf
+from scipy.optimize import differential_evolution
+from scipy.integrate import quad
+import matplotlib.pyplot as plt
+np.random.seed(42)
+
+
+# Fetch S&P 500 returns
+def fetch_sp500_data():
+    sp500 = yf.Ticker('^GSPC')
+    sp500_data = sp500.history(start='2014-01-01', end='2023-01-01')
+    sp500_returns = sp500_data['Close'].pct_change().dropna()
+    return sp500_returns.to_numpy(), sp500_data.index[1:]
+
+# Fetch VIX data
+def fetch_vix_data():
+    vix = yf.Ticker('^VIX')
+    vix_data = vix.history(start='2014-01-01', end='2023-01-01')
+    vix_data = vix_data['Close'].dropna()
+    return vix_data.to_numpy(), vix_data.index
+
+def update_ht(omega, beta, alpha, delta_star, ht_prev, epsilon):
+    epsilon_adj = epsilon - delta_star * np.sqrt(ht_prev)
+    epsilon_adj_squared = np.clip(epsilon_adj ** 2, 0, 1e8)
+    new_ht = omega + beta * ht_prev + alpha * epsilon_adj_squared 
+    return max(new_ht, 1e-8)
+
+# Function to iteratively calculate ht and epsilon series
+def calculate_ht_epsilon_series(params, returns, risk_free):
+    omega, beta, alpha, delta = params
+    M = len(returns)
+    
+    ht_series = np.zeros(M)
+    epsilon_series = np.zeros(M)
+    
+    # Initialize the first value of ht_series
+    ht_series[0] = np.var(returns)
+    
+    for i in range(1, M):
+        ht_sqrt = np.sqrt(ht_series[i-1])
+        ht_sqrt = max(ht_sqrt, 1e-8)
+        epsilon_series[i-1] = (returns[i-1] - risk_free + 0.5 * ht_series[i-1]) / ht_sqrt
+        ht_series[i] = update_ht(omega, beta, alpha, delta, ht_series[i-1], epsilon_series[i-1])
+    
+    ht_sqrt = np.sqrt(ht_series[-1])
+    ht_sqrt = max(ht_sqrt, 1e-8)
+    epsilon_series[-1] = (returns[-1] - risk_free + 0.5 * ht_series[-1]) / ht_sqrt
+    
+    return ht_series, epsilon_series
+
+# Model-implied VIX calculation
+def model_implied_vix_series(params, ht_series, n):
+    omega, betatilde, alpha, delta = params
+    
+    long_run_variance = omega / (1 - betatilde)
+    long_run_variance = max(long_run_variance, 1e-8)
+    
+    vix_series = 100 * np.sqrt(252 * ((1 - betatilde) * long_run_variance + betatilde * ht_series))
+    vix_series = np.nan_to_num(vix_series, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    return vix_series
+
+def log_likelihood_vix(params, returns, vix_data, risk_free):
+    omega, beta, alpha, delta = params
+    
+    # Calculate betatilde
+    betatilde = beta + alpha * delta ** 2
+    
+    # Apply penalty if betatilde exceeds 1
+    if betatilde >= 1:
+        penalty = 1000 * (betatilde - 1) ** 2
+    else:
+        penalty = 0
+    
+    # Calculate ht and epsilon series
+    ht_series, epsilon_series = calculate_ht_epsilon_series(params, returns, risk_free)
+    
+    # Number of trading days to maturity
+    n = 22
+    
+    # Calculate model-implied VIX series
+    vix_model = model_implied_vix_series(params, ht_series, n)
+    
+    # Calculate pricing errors
+    u_t = (vix_data - vix_model) / (np.sqrt(252) * 100)
+    
+    # Sample variance of pricing errors
+    sigma_v2 = np.var(u_t)
+    
+    # Log-likelihood with penalty
+    M = len(vix_data)
+    log_likelihood = -0.5 * M * np.log(2 * np.pi * sigma_v2) - (1 / (2 * sigma_v2)) * np.sum(u_t ** 2)
+    
+    return -log_likelihood 
+
+# Fetch data
+returns, sp500_dates = fetch_sp500_data()
+vix_data, vix_dates = fetch_vix_data()
+risk_free = 0.05 / 252
+
+# Ensure the lengths of the series match
+min_length = min(len(returns), len(vix_data))
+returns = returns[:min_length]
+sp500_dates = sp500_dates[:min_length]
+vix_data = vix_data[:min_length]
+vix_dates = vix_dates[:min_length]
+
+# Initial parameter guesses
+initial_params = [0.003, 0.2, 0.1, 0.1]  # No delta_star
+
+# Updated bounds for 4 parameters including delta
+bounds = [
+    (1e-8, 1),  # Omega
+    (0, 0.999),  # Beta
+    (0, 1),      # Alpha
+    (0, 500)     # Delta
+]
+
+# Perform optimization
+result = differential_evolution(
+    log_likelihood_vix, 
+    bounds, 
+    args=(returns, vix_data, risk_free), 
+    popsize=20, 
+    maxiter=1000, 
+    tol=1e-8,
+    strategy='best2bin'
+)
+
+# Extract the estimated parameters
+omega_hat, beta_hat, alpha_hat, delta_hat = result.x
+
+# Calculate betatilde using the optimized values
+betatilde_hat = beta_hat + alpha_hat * delta_hat ** 2
+
+# Calculate ht and epsilon series with estimated parameters
+ht_series, epsilon_series = calculate_ht_epsilon_series(result.x, returns, risk_free)
+
+# Example value for number of trading days to maturity
+n = 5
+vix_model = model_implied_vix_series(result.x, ht_series, n)
+omegatilde = omega_hat + alpha_hat
+long_run_variance = omegatilde / (1 - betatilde_hat)
+gamma_hat = (1 - (betatilde_hat ** n))/(n * (1-betatilde_hat))
+
+# Print results
+print("Estimated Parameters:")
+print("Omega:", omega_hat)
+print("Beta:", beta_hat)
+print("Alpha:", alpha_hat)
+print("Deltastar:", delta_hat)
+print("Betatilde:", betatilde_hat)
+print("Lon Run variance: ", long_run_variance)
+print("Gamma: ", gamma_hat)
+
+# Recalculate the log-likelihood with the optimized parameters
+final_log_likelihood = log_likelihood_vix(result.x, returns, vix_data, risk_free)
+print("Final Log-likelihood:", -final_log_likelihood)
+
+# Plot the model-implied VIX against the actual VIX
+plt.figure(figsize=(14, 7))
+plt.plot(vix_dates, vix_data, label='Actual VIX', color='blue')
+plt.plot(vix_dates, vix_model, label='Model-implied VIX', color='red', linestyle='--')
+plt.ylabel('VIX')
+plt.xticks(fontsize=12)         
+plt.legend(fontsize=16)
+plt.grid(True)
+plt.show()
+
